@@ -22,38 +22,11 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/bpffs"
 	"github.com/cilium/ebpf/features"
 
 	"golang.org/x/sys/unix"
 )
-
-const bpfTokenCreate = 36 // BPF_TOKEN_CREATE command number
-
-// tokenCreateAttr mirrors the kernel's bpf_attr for BPF_TOKEN_CREATE.
-type tokenCreateAttr struct {
-	flags   uint32
-	bpffsFd uint32
-}
-
-func createBPFToken(bpffsPath string) (int, error) {
-	bpffsFd, err := unix.Open(bpffsPath, unix.O_DIRECTORY, 0)
-	if err != nil {
-		return -1, fmt.Errorf("open bpffs %s: %w", bpffsPath, err)
-	}
-	defer unix.Close(bpffsFd)
-
-	attr := tokenCreateAttr{bpffsFd: uint32(bpffsFd)}
-	fd, _, errno := unix.Syscall(
-		unix.SYS_BPF,
-		uintptr(bpfTokenCreate),
-		uintptr(unsafe.Pointer(&attr)),
-		unsafe.Sizeof(attr),
-	)
-	if errno != 0 {
-		return -1, fmt.Errorf("BPF_TOKEN_CREATE: %w", errno)
-	}
-	return int(fd), nil
-}
 
 func dropBPFCaps() error {
 	// Capabilities to drop: CAP_SYS_ADMIN=21, CAP_PERFMON=38, CAP_BPF=39
@@ -68,7 +41,7 @@ func dropBPFCaps() error {
 
 	// Also clear the caps from the effective/permitted sets via capset.
 	// We need to read current caps, clear the BPF-related ones, then write back.
-	var hdr [2]uint64 // version + pid
+	var hdr [2]uint64     // version + pid
 	var data [2][3]uint64 // effective, permitted, inheritable (x2 for 64-bit)
 
 	// Use _LINUX_CAPABILITY_VERSION_3 = 0x20080522
@@ -213,12 +186,18 @@ func main() {
 
 	// Step 1: Create BPF token (needs CAP_BPF)
 	fmt.Printf("Creating BPF token from %s...\n", bpffsPath)
-	tokenFD, err := createBPFToken(bpffsPath)
+	bfs, err := bpffs.NewBPFFSFromPath(bpffsPath)
+	if err != nil {
+		log.Fatalf("Failed to init bpffs: %v", err)
+	}
+	defer bfs.Close()
+
+	token, err := bfs.Token()
 	if err != nil {
 		log.Fatalf("Failed to create BPF token: %v", err)
 	}
-	defer unix.Close(tokenFD)
-	fmt.Printf("BPF token created: fd=%d\n", tokenFD)
+	defer token.Close()
+	fmt.Printf("BPF token created: fd=%d\n", token.Int())
 
 	// Step 2: Optionally drop BPF capabilities
 	if dropCaps {
@@ -230,7 +209,7 @@ func main() {
 	}
 
 	// Step 3: Run all probes
-	runProbes(tokenFD)
+	runProbes(token.Int())
 
 	fmt.Println("\nDone.")
 }
